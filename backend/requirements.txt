@@ -1,0 +1,10 @@
+fastapi==0.136.1
+uvicorn==0.46.0
+python-multipart==0.0.27
+python-dotenv==1.2.2
+langchain-anthropic
+langchain-core
+langgraph
+pydantic==2.13.3
+supabase
+PyJWT
