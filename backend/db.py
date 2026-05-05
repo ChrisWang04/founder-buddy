@@ -56,3 +56,20 @@ def get_user_conversations(user_id: str) -> list:
     """获取用户所有对话"""
     result = supabase.table("conversations").select("*, business_plans(content)").eq("user_id", user_id).order("created_at", desc=True).execute()
     return result.data or []
+
+def save_message(conversation_id: int, role: str, content: str) -> dict:
+    """存单条消息"""
+    result = supabase.table("messages").insert({
+        "conversation_id": conversation_id,
+        "role": role,
+        "content": content,
+    }).execute()
+    return result.data[0] if result.data else None
+
+
+def get_messages(conversation_id: int) -> list:
+    """获取对话的所有消息"""
+    result = supabase.table("messages").select("*").eq(
+        "conversation_id", conversation_id
+    ).order("created_at").execute()
+    return result.data or []

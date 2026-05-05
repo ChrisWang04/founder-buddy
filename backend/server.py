@@ -8,7 +8,13 @@ import time
 import uuid
 
 from agent import graph
-from db import create_conversation, get_conversation, save_business_plan
+from db import (
+    create_conversation,
+    get_conversation,
+    get_messages,
+    save_business_plan,
+    save_message,
+)
 
 app = FastAPI(title="Founder Buddy API")
 
@@ -111,7 +117,14 @@ def chat_start(req: StartRequest, user_id: str | None = Depends(get_user_id)):
 
     graph.invoke(initial_state, config)
     state = graph.get_state(config)
-    return build_response(session_id, state)
+    response = build_response(session_id, state)
+
+    if conversation_id:
+        save_message(conversation_id, "user", req.message)
+        if response.agent_message:
+            save_message(conversation_id, "assistant", response.agent_message)
+
+    return response
 
 
 # ─── POST /chat/message ───────────────────────────────────
@@ -129,10 +142,14 @@ def chat_message(req: MessageRequest):
     state = graph.get_state(config)
     response = build_response(req.session_id, state)
 
-    if response.is_done and response.business_plan is not None:
-        conversation = get_conversation(req.session_id)
-        if conversation:
-            save_business_plan(conversation["id"], response.business_plan)
+    conversation = get_conversation(req.session_id)
+    if conversation:
+        conv_id = conversation["id"]
+        save_message(conv_id, "user", req.message)
+        if response.agent_message:
+            save_message(conv_id, "assistant", response.agent_message)
+        if response.is_done and response.business_plan:
+            save_business_plan(conv_id, response.business_plan)
 
     return response
 
@@ -148,6 +165,16 @@ def chat_state(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found.")
 
     return build_response(session_id, state)
+
+
+# ─── GET /chat/messages ───────────────────────────────────
+@app.get("/chat/messages")
+def get_chat_messages(session_id: str):
+    conversation = get_conversation(session_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Session not found")
+    messages = get_messages(conversation["id"])
+    return {"messages": messages}
 
 
 # ─── 健康检查 ─────────────────────────────────────────────

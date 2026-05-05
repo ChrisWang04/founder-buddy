@@ -119,21 +119,37 @@ export default function FounderBuddyApp() {
 
   const handleLoadConversation = async (sessionId: string, businessPlan: string | null) => {
     setSessionId(sessionId);
-    setMessages([]);
-    setProgress(initialProgress);
     setBusinessPlan(businessPlan);
     setIsLoading(false);
 
     try {
-      const response = await fetch(`${API_BASE_URL}/chat/state?session_id=${encodeURIComponent(sessionId)}`);
-      if (!response.ok) return;
+      const { data: { session } } = await supabase.auth.getSession();
+      const headers = { "Authorization": `Bearer ${session?.access_token}` };
 
-      const data = await response.json();
-      if (data.section_status && Object.keys(data.section_status).length > 0) {
-        setProgress(data.section_status);
+      const msgResponse = await fetch(
+        `${API_BASE_URL}/chat/messages?session_id=${encodeURIComponent(sessionId)}`,
+        { headers }
+      );
+      if (msgResponse.ok) {
+        const msgData = await msgResponse.json();
+        const loadedMessages: Message[] = msgData.messages.map(
+          (m: { role: string; content: string; id: number }) => ({
+            id: m.id.toString(),
+            role: m.role as "user" | "assistant",
+            content: m.content,
+          })
+        );
+        setMessages(loadedMessages);
       }
-      if (data.business_plan) {
-        setBusinessPlan(data.business_plan);
+
+      const stateResponse = await fetch(
+        `${API_BASE_URL}/chat/state?session_id=${encodeURIComponent(sessionId)}`,
+        { headers }
+      );
+      if (stateResponse.ok) {
+        const data = await stateResponse.json();
+        if (data.section_status) setProgress(data.section_status);
+        if (data.business_plan) setBusinessPlan(data.business_plan);
       }
     } catch (error) {
       console.error("Error loading conversation:", error);
