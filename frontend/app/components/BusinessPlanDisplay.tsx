@@ -5,7 +5,13 @@ import { Copy, Check } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-export default function BusinessPlanDisplay({ content }: { content: string }) {
+export default function BusinessPlanDisplay({
+  content,
+  streaming = false,
+}: {
+  content: string;
+  streaming?: boolean;
+}) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
@@ -22,13 +28,18 @@ export default function BusinessPlanDisplay({ content }: { content: string }) {
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-8 gap-4 border-b border-slate-100 pb-6">
         <div>
           <h2 className="text-2xl font-bold text-slate-800 tracking-tight">Your Business Plan</h2>
-          <p className="text-sm text-slate-500 mt-1">Generated based on our conversation</p>
+          <p className="text-sm text-slate-500 mt-1">
+            {streaming ? "Generating your plan…" : "Generated based on our conversation"}
+          </p>
         </div>
         <button
           onClick={handleCopy}
+          disabled={streaming}
           className={`flex items-center gap-2 px-5 py-2.5 rounded-full transition-all text-sm font-medium ${
             copied
               ? "bg-emerald-50 text-emerald-600 border border-emerald-200"
+              : streaming
+              ? "bg-slate-50 text-slate-400 border border-slate-200 cursor-not-allowed"
               : "bg-white text-slate-700 border border-slate-200 hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 shadow-sm"
           }`}
         >
@@ -53,6 +64,9 @@ export default function BusinessPlanDisplay({ content }: { content: string }) {
         prose-blockquote:border-l-4 prose-blockquote:border-blue-200 prose-blockquote:bg-blue-50/50 prose-blockquote:rounded-r-lg
         prose-hr:border-slate-100">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+        {streaming && (
+          <span className="inline-block w-0.5 h-5 bg-blue-500 ml-0.5 align-middle animate-pulse" />
+        )}
       </div>
     </div>
   );

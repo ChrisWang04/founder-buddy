@@ -26,7 +26,9 @@ export default function FounderBuddyApp() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [businessPlan, setBusinessPlan] = useState<string | null>(null);
+  const [streamingBP, setStreamingBP] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [convListKey, setConvListKey] = useState(0);
   const [user, setUser] = useState<User | null>(null);
   const supabase = createClient();
   const router = useRouter();
@@ -55,45 +57,98 @@ export default function FounderBuddyApp() {
     setIsLoading(true);
 
     try {
-      let data;
       const { data: { session } } = await supabase.auth.getSession();
       const headers = {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${session?.access_token}`,
       };
 
+      // First message: use /chat/start (JSON, no streaming needed)
       if (!sessionId) {
         const response = await fetch(`${API_BASE_URL}/chat/start`, {
           method: "POST",
           headers,
           body: JSON.stringify({ message: content }),
         });
-        data = await response.json();
+        const data = await response.json();
         setSessionId(data.session_id);
-      } else {
-        const response = await fetch(`${API_BASE_URL}/chat/message`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ session_id: sessionId, message: content }),
-        });
-        data = await response.json();
+        setConvListKey(k => k + 1);
+        if (data.section_status && Object.keys(data.section_status).length > 0) {
+          setProgress(data.section_status);
+        }
+        if (data.agent_message) {
+          setMessages((prev) => [...prev, {
+            id: (Date.now() + 1).toString(),
+            role: "assistant",
+            content: data.agent_message,
+          }]);
+        }
+        return;
       }
 
-      if (data.section_status && Object.keys(data.section_status).length > 0) {
-        setProgress(data.section_status);
+      // Subsequent messages: use /chat/stream (SSE)
+      const response = await fetch(`${API_BASE_URL}/chat/stream`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ session_id: sessionId, message: content }),
+      });
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Server error: ${response.status}`);
       }
 
-      if (data.is_done && data.business_plan) {
-        setBusinessPlan(data.business_plan);
-      }
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
 
-      if (data.agent_message) {
-        const assistantMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          role: "assistant",
-          content: data.agent_message,
-        };
-        setMessages((prev) => [...prev, assistantMessage]);
+      const processBuffer = () => {
+        const parts = buffer.split("\n\n");
+        buffer = parts.pop() ?? "";
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === "token") {
+              setStreamingBP((prev) => prev + event.content);
+            } else if (event.type === "done") {
+              // Set businessPlan before clearing streamingBP to avoid a
+              // render frame where both are empty and the panel unmounts
+              if (event.is_done && event.business_plan) {
+                setBusinessPlan(event.business_plan);
+              }
+              setStreamingBP("");
+              if (event.section_status && Object.keys(event.section_status).length > 0) {
+                setProgress(event.section_status);
+              }
+              if (event.agent_message) {
+                setMessages((prev) => [...prev, {
+                  id: (Date.now() + 1).toString(),
+                  role: "assistant",
+                  content: event.agent_message,
+                }]);
+              }
+            } else if (event.type === "error") {
+              throw new Error(event.detail ?? "Stream error");
+            }
+          } catch (e) {
+            if (e instanceof SyntaxError) continue; // malformed SSE — skip
+            throw e;
+          }
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          // Flush any bytes still held in the decoder's internal buffer
+          // (e.g. a multi-byte UTF-8 sequence split across the last chunk)
+          buffer += decoder.decode();
+          processBuffer();
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+        processBuffer();
       }
     } catch (error) {
       console.error("Error:", error);
@@ -106,15 +161,25 @@ export default function FounderBuddyApp() {
         },
       ]);
     } finally {
+      // Always clear streaming state even if the stream ends without a done event
+      setStreamingBP("");
       setIsLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (businessPlan) {
+      setConvListKey(k => k + 1);
+    }
+  }, [businessPlan]);
 
   const handleNewConversation = () => {
     setSessionId(null);
     setMessages([]);
     setProgress(initialProgress);
     setBusinessPlan(null);
+    setStreamingBP("");
+    setIsLoading(false); // reset in case a fetch was in-flight when the user switched
   };
 
   const handleLoadConversation = async (sessionId: string, businessPlan: string | null) => {
@@ -126,13 +191,14 @@ export default function FounderBuddyApp() {
       const { data: { session } } = await supabase.auth.getSession();
       const headers = { "Authorization": `Bearer ${session?.access_token}` };
 
+      let loadedMessages: Message[] = [];
       const msgResponse = await fetch(
         `${API_BASE_URL}/chat/messages?session_id=${encodeURIComponent(sessionId)}`,
         { headers }
       );
       if (msgResponse.ok) {
         const msgData = await msgResponse.json();
-        const loadedMessages: Message[] = msgData.messages.map(
+        loadedMessages = msgData.messages.map(
           (m: { role: string; content: string; id: number }) => ({
             id: m.id.toString(),
             role: m.role as "user" | "assistant",
@@ -150,6 +216,41 @@ export default function FounderBuddyApp() {
         const data = await stateResponse.json();
         if (data.section_status) setProgress(data.section_status);
         if (data.business_plan) setBusinessPlan(data.business_plan);
+
+        // Show the pending question if it isn't already the last DB message.
+        // This covers the race where _persist_stream hasn't flushed yet, and
+        // also makes it obvious what the agent is waiting for on resume.
+        if (data.agent_message) {
+          const last = loadedMessages[loadedMessages.length - 1];
+          const alreadyShown =
+            last?.role === "assistant" && last.content === data.agent_message;
+          if (!alreadyShown) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: `pending-${Date.now()}`,
+                role: "assistant" as const,
+                content: data.agent_message,
+              },
+            ]);
+          }
+        }
+      } else if (stateResponse.status === 404) {
+        // Session exists in the database but has no graph checkpoint — it was
+        // likely created before the PostgreSQL checkpointer was configured.
+        // Sending messages would fail with a confusing 404, so clear the
+        // session and let the user know they need to start fresh.
+        setSessionId(null);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `notice-${Date.now()}`,
+            role: "assistant" as const,
+            content:
+              "This conversation can't be resumed (it's from an older session). " +
+              "You can still view the history above, but please start a new conversation to continue.",
+          },
+        ]);
       }
     } catch (error) {
       console.error("Error loading conversation:", error);
@@ -178,6 +279,7 @@ export default function FounderBuddyApp() {
             <ConversationList
               onNewConversation={handleNewConversation}
               onLoadConversation={handleLoadConversation}
+              refreshKey={convListKey}
             />
           </div>
 
@@ -210,9 +312,12 @@ export default function FounderBuddyApp() {
               onSendMessage={handleSendMessage}
               isLoading={isLoading}
             />
-            {businessPlan && (
+            {(streamingBP || businessPlan) && (
               <div className="mt-8">
-                <BusinessPlanDisplay content={businessPlan} />
+                <BusinessPlanDisplay
+                  content={streamingBP || businessPlan!}
+                  streaming={!!streamingBP}
+                />
               </div>
             )}
           </div>

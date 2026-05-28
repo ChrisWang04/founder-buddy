@@ -4,10 +4,10 @@ from typing import Annotated
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnableConfig
 
 load_dotenv()
 
@@ -98,17 +98,6 @@ SECTION_ALIASES = {
 }
 
 llm = ChatAnthropic(model="claude-sonnet-4-6")
-
-
-# ─── 流式输出辅助函数 ─────────────────────────────────────
-def stream_response(prompt: str) -> str:
-    """流式打印 LLM 输出，返回完整文字"""
-    full_text = ""
-    for chunk in llm.stream(prompt):
-        print(chunk.content, end="", flush=True)
-        full_text += chunk.content
-    print()
-    return full_text
 
 
 # ─── 映射辅助函数 ─────────────────────────────────────────
@@ -308,9 +297,7 @@ def section_node(state: FounderBuddyState):
 
 
 # ─── 生成 BP 节点 ───────────────────────────────────────────
-def generate_bp_node(state: FounderBuddyState):
-    """所有章节完成后，流式生成完整商业计划书"""
-
+async def generate_bp_node(state: FounderBuddyState, config: RunnableConfig):
     bp_prompt = f"""<role>
 You are an experienced startup advisor and business plan writer.
 Your job is to turn a founder's raw answers into a compelling, investor-ready business plan.
@@ -389,9 +376,10 @@ Write these 7 sections in order:
 - Keep each section focused and concise.
 </hard_limits>"""
 
-    print("\n=== Generating Your Business Plan ===\n")
-    full_response = stream_response(bp_prompt)
-    return {"messages": [AIMessage(content=full_response)]}
+    full_text = ""
+    async for chunk in llm.astream(bp_prompt, config):
+        full_text += chunk.content
+    return {"messages": [AIMessage(content=full_text)]}
 
 
 # ─── 编辑 BP 节点 ───────────────────────────────────────────
@@ -511,13 +499,12 @@ builder.add_conditional_edges("section", section_router, {
 })
 builder.add_edge("generate_bp", "edit")
 
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
-
-
 # ─── 终端测试入口 ───────────────────────────────────────────
 if __name__ == "__main__":
     import time
+    from langgraph.checkpoint.memory import MemorySaver
+
+    _graph = builder.compile(checkpointer=MemorySaver())
     config = {"configurable": {"thread_id": f"session-{int(time.time())}"}}
 
     initial_state = {
@@ -542,10 +529,10 @@ if __name__ == "__main__":
     first_input = input("You: ").strip()
     initial_state["messages"] = [HumanMessage(content=first_input)]
 
-    graph.invoke(initial_state, config)
+    _graph.invoke(initial_state, config)
 
     while True:
-        state = graph.get_state(config)
+        state = _graph.get_state(config)
 
         if not state.tasks or not state.tasks[0].interrupts:
             break
@@ -557,6 +544,6 @@ if __name__ == "__main__":
         print(f"\nAgent: {interrupt_msg}")
 
         user_input = input("You: ").strip()
-        graph.invoke(Command(resume=user_input), config)
+        _graph.invoke(Command(resume=user_input), config)
 
     print("\n=== Done! ===")

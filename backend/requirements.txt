@@ -5,6 +5,8 @@ python-dotenv==1.2.2
 langchain-anthropic
 langchain-core
 langgraph
+langgraph-checkpoint-postgres
+psycopg[binary,pool]
 pydantic==2.13.3
 supabase
 PyJWT

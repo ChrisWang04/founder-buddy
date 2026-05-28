@@ -7,6 +7,7 @@ import { Trash2 } from "lucide-react";
 interface Props {
   onNewConversation: () => void;
   onLoadConversation: (sessionId: string, businessPlan: string | null) => void;
+  refreshKey?: number;
 }
 
 interface Conversation {
@@ -15,12 +16,20 @@ interface Conversation {
   session_id: string;
   created_at: string;
   business_plans?: { content: string }[];
+  messages?: { content: string; role: string }[];
 }
 
 function getConversationLabel(conversation: Conversation) {
   const content = conversation.business_plans?.[0]?.content;
-  if (!content) return "New conversation";
-  return content.length > 40 ? `${content.slice(0, 40)}...` : content;
+  if (content) {
+    return content.length > 40 ? `${content.slice(0, 40)}...` : content;
+  }
+  const firstUserMessage = conversation.messages?.find((m) => m.role === "user");
+  if (firstUserMessage) {
+    const text = firstUserMessage.content;
+    return text.length > 40 ? `${text.slice(0, 40)}...` : text;
+  }
+  return "New conversation";
 }
 
 function formatDate(date: string) {
@@ -30,7 +39,7 @@ function formatDate(date: string) {
   });
 }
 
-export default function ConversationList({ onNewConversation, onLoadConversation }: Props) {
+export default function ConversationList({ onNewConversation, onLoadConversation, refreshKey }: Props) {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
@@ -56,7 +65,7 @@ export default function ConversationList({ onNewConversation, onLoadConversation
 
       const { data } = await supabase
         .from("conversations")
-        .select("*, business_plans(content)")
+        .select("*, business_plans(content), messages(content, role)")
         .eq("user_id", user.id)
         .order("created_at", { ascending: false })
         .limit(10);
@@ -66,7 +75,7 @@ export default function ConversationList({ onNewConversation, onLoadConversation
     };
 
     fetchConversations();
-  }, []);
+  }, [refreshKey]);
 
   return (
     <div className="space-y-4 mt-6 pt-6 border-t border-slate-800/60">
