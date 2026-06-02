@@ -1,0 +1,35 @@
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "--cov=. --cov-branch --cov-report=term-missing --cov-fail-under=85"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["."]
+branch = true
+omit = [
+    "db.py",
+    "venv/*",
+    "tests/*",
+    "conftest.py",
+    "pyproject.toml",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "if __name__ == .__main__.:",
+    "pragma: no cover",
+    "raise NotImplementedError",
+]
+show_missing = true
+skip_covered = false
+
+[tool.mutmut]
+paths_to_mutate = ["agent.py", "server.py"]
+tests_dir = "tests/"
+runner = "pytest -x --no-cov -q"

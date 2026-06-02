@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase";
+import { getConversationLabel } from "@/lib/conversationLabel";
 import { Trash2 } from "lucide-react";
 
 interface Props {
@@ -17,19 +18,6 @@ interface Conversation {
   created_at: string;
   business_plans?: { content: string }[];
   messages?: { content: string; role: string }[];
-}
-
-function getConversationLabel(conversation: Conversation) {
-  const content = conversation.business_plans?.[0]?.content;
-  if (content) {
-    return content.length > 40 ? `${content.slice(0, 40)}...` : content;
-  }
-  const firstUserMessage = conversation.messages?.find((m) => m.role === "user");
-  if (firstUserMessage) {
-    const text = firstUserMessage.content;
-    return text.length > 40 ? `${text.slice(0, 40)}...` : text;
-  }
-  return "New conversation";
 }
 
 function formatDate(date: string) {

@@ -6,6 +6,7 @@ import ConversationList from "./ConversationList";
 import ChatInterface, { type Message } from "./ChatInterface";
 import BusinessPlanDisplay from "./BusinessPlanDisplay";
 import { createClient } from "@/lib/supabase";
+import { parseSSEBuffer } from "@/lib/sse";
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
@@ -102,38 +103,32 @@ export default function FounderBuddyApp() {
       let buffer = "";
 
       const processBuffer = () => {
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() ?? "";
-        for (const part of parts) {
-          const line = part.trim();
-          if (!line.startsWith("data: ")) continue;
-          try {
-            const event = JSON.parse(line.slice(6));
-            if (event.type === "token") {
-              setStreamingBP((prev) => prev + event.content);
-            } else if (event.type === "done") {
-              // Set businessPlan before clearing streamingBP to avoid a
-              // render frame where both are empty and the panel unmounts
-              if (event.is_done && event.business_plan) {
-                setBusinessPlan(event.business_plan);
-              }
-              setStreamingBP("");
-              if (event.section_status && Object.keys(event.section_status).length > 0) {
-                setProgress(event.section_status);
-              }
-              if (event.agent_message) {
-                setMessages((prev) => [...prev, {
-                  id: (Date.now() + 1).toString(),
-                  role: "assistant",
-                  content: event.agent_message,
-                }]);
-              }
-            } else if (event.type === "error") {
-              throw new Error(event.detail ?? "Stream error");
+        const { events, remainder } = parseSSEBuffer(buffer);
+        buffer = remainder;
+        for (const event of events) {
+          if (event.type === "token") {
+            setStreamingBP((prev) => prev + (event as { content: string }).content);
+          } else if (event.type === "done") {
+            const doneEvent = event as Record<string, unknown>;
+            // Set businessPlan before clearing streamingBP to avoid a
+            // render frame where both are empty and the panel unmounts
+            if (doneEvent.is_done && doneEvent.business_plan) {
+              setBusinessPlan(doneEvent.business_plan as string);
             }
-          } catch (e) {
-            if (e instanceof SyntaxError) continue; // malformed SSE — skip
-            throw e;
+            setStreamingBP("");
+            const sectionStatus = doneEvent.section_status as Record<string, string> | undefined;
+            if (sectionStatus && Object.keys(sectionStatus).length > 0) {
+              setProgress(sectionStatus as unknown as ProgressState);
+            }
+            if (doneEvent.agent_message) {
+              setMessages((prev) => [...prev, {
+                id: (Date.now() + 1).toString(),
+                role: "assistant",
+                content: doneEvent.agent_message as string,
+              }]);
+            }
+          } else if (event.type === "error") {
+            throw new Error((event as { detail?: string }).detail ?? "Stream error");
           }
         }
       };

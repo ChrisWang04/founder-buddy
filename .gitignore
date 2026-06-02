@@ -6,3 +6,8 @@ venv/
 .next/
 node_modules/
 .vercel
+.coverage
+*.tsbuildinfo
+.pytest_cache/
+htmlcov/
+coverage/
