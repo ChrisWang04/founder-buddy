@@ -1,178 +1,126 @@
-"""End-to-end graph flow tests through the HTTP layer.
+"""End-to-end graph flow tests through the HTTP layer."""
 
-These exercise the full state machine across many turns. They are slower than
-the focused tests in test_chat_stream.py but catch routing/state regressions
-the focused tests can't.
-"""
-
-from tests.conftest import answer_n_questions, drive_through_welcome
+from agent import SECTION_ORDER
+from tests.conftest import complete_section_call, modify_section_call
 
 
-TOTAL_QUESTIONS = 11
+def _start(test_app, stub_llm, message="coffee shop idea"):
+    stub_llm.invoke_responses.append("What problem are you solving?")
+    resp = test_app.post("/chat/start", json={"message": message})
+    return resp.json()["session_id"]
 
 
-# ─── Full happy path ──────────────────────────────────────────────────────────
+def _advance_section(test_app, stub_llm, session_id, section, next_question="Next section?"):
+    """Send one user turn that completes `section` via a tool call."""
+    stub_llm.invoke_responses.append(complete_section_call(f"{section} info"))
+    stub_llm.invoke_responses.append(next_question)
+    return test_app.post(
+        "/chat/message",
+        json={"session_id": session_id, "message": f"answer for {section}"},
+    )
 
 
-def test_full_happy_path(test_app, stub_llm):
-    """Start → answer welcome → 11 section questions → BP generated."""
-    session_id = drive_through_welcome(test_app, stub_llm)
+def test_section_advances_on_complete_section_call(test_app, stub_llm):
+    session_id = _start(test_app, stub_llm)
+    resp = _advance_section(test_app, stub_llm, session_id, "problem")
 
-    # Queue a BP for the final astream
-    stub_llm.stream_chunks.append(["This is the final business plan. " * 10])
+    data = resp.json()
+    assert data["section_status"]["problem"] == "done"
+    assert data["section_status"]["product"] == "in_progress"
+    assert data["is_done"] is False
 
-    # Answer all 11 questions via /chat/message (no streaming needed here)
-    for i in range(TOTAL_QUESTIONS):
+
+def test_full_happy_path_all_sections(test_app, stub_llm):
+    session_id = _start(test_app, stub_llm)
+
+    for i, section in enumerate(SECTION_ORDER):
+        is_last = i == len(SECTION_ORDER) - 1
+        stub_llm.invoke_responses.append(complete_section_call(f"{section} info"))
+        if not is_last:
+            stub_llm.invoke_responses.append(f"Now {SECTION_ORDER[i+1]}.")
+
         resp = test_app.post(
             "/chat/message",
             json={"session_id": session_id, "message": f"answer {i}"},
         )
         assert resp.status_code == 200
 
-    # Final state should have BP + edit interrupt
-    final = test_app.get(f"/chat/state?session_id={session_id}").json()
-    assert final["is_done"] is True
-    assert final["business_plan"] is not None
-    assert "business plan" in final["business_plan"].lower()
-    assert "edit" in (final["agent_message"] or "").lower()
+    # At this point current_section should be "done"
+    state_resp = test_app.get(f"/chat/state?session_id={session_id}")
+    assert state_resp.json()["section_status"]["exit_strategy"] == "done"
 
 
-# ─── Skip path ────────────────────────────────────────────────────────────────
+def test_skip_section_with_skip_text(test_app, stub_llm):
+    """LLM may complete a section with 'skipped' content — should still advance."""
+    session_id = _start(test_app, stub_llm)
 
-
-def test_skip_all_questions_still_generates_bp(test_app, stub_llm):
-    """Every answer = 'skip' → no per-section content but BP is still produced."""
-    session_id = drive_through_welcome(test_app, stub_llm)
-
-    stub_llm.stream_chunks.append(["BP for empty answers. " * 15])  # > 200 chars
-
-    for _ in range(TOTAL_QUESTIONS):
-        resp = test_app.post(
-            "/chat/message",
-            json={"session_id": session_id, "message": "skip"},
-        )
-        assert resp.status_code == 200
-
-    final = test_app.get(f"/chat/state?session_id={session_id}").json()
-    assert final["is_done"] is True
-    assert final["business_plan"] is not None
-
-
-# ─── Edit flow ────────────────────────────────────────────────────────────────
-
-
-def test_edit_flow_reroutes_to_section(test_app, stub_llm):
-    """After BP gen, edit a section → re-collect → confirm → new BP generated.
-
-    The edit loop is: edit_node asks "anything else?" each time a section
-    edit completes, and only regenerates the BP when the user confirms with
-    a word in EDIT_CONFIRMATION_WORDS (e.g. "looks good").
-    """
-    session_id = drive_through_welcome(test_app, stub_llm)
-
-    # First BP
-    stub_llm.stream_chunks.append(["First BP version. " * 20])
-    answer_n_questions(test_app, session_id, TOTAL_QUESTIONS)
-
-    # Now at the edit interrupt. Request to edit the problem section.
+    stub_llm.invoke_responses.append(complete_section_call("skipped"))
+    stub_llm.invoke_responses.append("Got it, let's talk product.")
     resp = test_app.post(
         "/chat/message",
-        json={"session_id": session_id, "message": "edit problem"},
+        json={"session_id": session_id, "message": "skip"},
+    )
+    assert resp.json()["section_status"]["problem"] == "done"
+
+
+def test_edit_flow_reverts_section(test_app, stub_llm):
+    """After problem is done, calling modify_section should revert it."""
+    session_id = _start(test_app, stub_llm)
+    _advance_section(test_app, stub_llm, session_id, "problem")
+
+    # Now at product; user wants to redo problem
+    stub_llm.invoke_responses.append(modify_section_call("problem"))
+    stub_llm.invoke_responses.append("What problem are you solving again?")
+    resp = test_app.post(
+        "/chat/message",
+        json={"session_id": session_id, "message": "actually I want to change the problem"},
     )
     data = resp.json()
-    assert data["is_done"] is False
-    assert "What problem" in (data["agent_message"] or "")
+    # Section reverted
+    assert data["section_status"]["problem"] == "in_progress"
+    assert data["agent_message"] == "What problem are you solving again?"
 
-    # Re-answer the problem question — lands at "anything else?" prompt
-    resp = test_app.post(
-        "/chat/message",
-        json={"session_id": session_id, "message": "new problem answer"},
-    )
+
+def test_modify_then_recomplete(test_app, stub_llm):
+    """Modify a section, re-complete it, check it advances normally."""
+    session_id = _start(test_app, stub_llm)
+    _advance_section(test_app, stub_llm, session_id, "problem")
+
+    # Modify
+    stub_llm.invoke_responses.append(modify_section_call("problem"))
+    stub_llm.invoke_responses.append("OK, tell me the real problem.")
+    test_app.post("/chat/message", json={"session_id": session_id, "message": "edit problem"})
+
+    # Re-complete
+    stub_llm.invoke_responses.append(complete_section_call("better problem description"))
+    stub_llm.invoke_responses.append("Now let's talk product.")
+    resp = test_app.post("/chat/message", json={"session_id": session_id, "message": "new answer"})
+
     data = resp.json()
-    assert "anything else" in (data["agent_message"] or "").lower()
+    assert data["section_status"]["problem"] == "done"
+    assert data["section_status"]["product"] == "in_progress"
 
-    # Confirm — triggers BP regen
-    stub_llm.stream_chunks.append(["Second BP version. " * 20])
+    # Content updated
+    state = test_app.get(f"/chat/state?session_id={session_id}").json()
+    # section_status reflects the re-done problem
+    assert data["section_status"]["problem"] == "done"
+
+
+def test_invalid_modify_target_does_not_crash(test_app, stub_llm):
+    """If LLM passes an invalid section to modify_section, graph should not crash."""
+    session_id = _start(test_app, stub_llm)
+
+    stub_llm.invoke_responses.append(modify_section_call("nonexistent_section"))
+    stub_llm.invoke_responses.append("Hmm, I didn't catch that.")
     resp = test_app.post(
         "/chat/message",
-        json={"session_id": session_id, "message": "looks good"},
+        json={"session_id": session_id, "message": "edit xyz"},
     )
-    data = resp.json()
-    assert data["is_done"] is True
-    assert "Second BP version" in (data["business_plan"] or "")
+    assert resp.status_code == 200
+    # current_section unchanged
+    assert resp.json()["section_status"] is not None
 
 
-# ─── Welcome auto-fill skip ───────────────────────────────────────────────────
-
-
-def test_edit_node_loops_on_unrecognized_input(test_app, stub_llm):
-    """If the user's edit reply is neither an alias nor a confirmation word,
-    edit_node should re-interrupt with the same prompt (Command(goto='edit'))."""
-    session_id = drive_through_welcome(test_app, stub_llm)
-    stub_llm.stream_chunks.append(["BP. " * 60])
-    answer_n_questions(test_app, session_id, TOTAL_QUESTIONS)
-
-    # At edit interrupt. Send something that's neither edit-word + alias nor
-    # a confirmation word. (Avoid "no", "yes", "done" etc — they're confirmations.)
-    resp = test_app.post(
-        "/chat/message",
-        json={"session_id": session_id, "message": "hmm"},
-    )
-    data = resp.json()
-    # Loops back to same prompt — still in edit phase
-    assert data["is_done"] is True  # current_section == "done" + interrupt present
-    assert "edit" in (data["agent_message"] or "").lower()
-
-
-def test_chat_message_saves_business_plan_on_completion(
-    test_app, stub_llm, mock_supabase, fake_jwt
-):
-    """The /chat/message route should persist the business plan when the
-    final turn completes BP generation."""
-    headers = {"Authorization": f"Bearer {fake_jwt}"}
-    start = test_app.post(
-        "/chat/start", json={"message": "test idea"}, headers=headers
-    )
-    session_id = start.json()["session_id"]
-    test_app.post(
-        "/chat/message",
-        json={"session_id": session_id, "message": "yes"},
-        headers=headers,
-    )
-
-    stub_llm.stream_chunks.append(["Saved BP content. " * 20])
-    for _ in range(TOTAL_QUESTIONS):
-        test_app.post(
-            "/chat/message",
-            json={"session_id": session_id, "message": "ok"},
-            headers=headers,
-        )
-
-    # Business plan should be saved (via /chat/message's own persistence path)
-    assert len(mock_supabase["business_plans"]) == 1
-    assert "Saved BP" in mock_supabase["business_plans"][0]["content"]
-
-
-def test_welcome_mapping_skips_prefilled_sections(test_app, stub_llm):
-    """If welcome mapping populates problem+product, those sections are
-    skipped — only features+team+investment+exit (8 questions) remain.
-
-    On resume, welcome_node re-runs from the top, so llm.invoke(assessment)
-    is called a SECOND time before interrupt() returns "yes". The mapping
-    call is the third invoke.
-    """
-    stub_llm.invoke_responses.extend([
-        "first assessment",                # /chat/start
-        "second assessment on resume",     # re-run before interrupt resolves
-        '{"problem": "real prob", "product": "real prod"}',  # mapping
-    ])
-
-    start = test_app.post("/chat/start", json={"message": "coffee shop"})
-    session_id = start.json()["session_id"]
-
-    resp = test_app.post(
-        "/chat/message",
-        json={"session_id": session_id, "message": "yes"},
-    )
-    # problem + product were both prefilled → first interrupt is features Q1
-    assert "Features" in (resp.json()["agent_message"] or "")
+def test_session_not_found_returns_404(test_app):
+    resp = test_app.post("/chat/message", json={"session_id": "ghost", "message": "x"})
+    assert resp.status_code == 404

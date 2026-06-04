@@ -1,8 +1,4 @@
-"""Shared test fixtures.
-
-Env vars are set BEFORE any backend module is imported, so the module-level
-ChatAnthropic() and supabase create_client() calls don't fail.
-"""
+"""Shared test fixtures for the agent-driven (ReAct) graph design."""
 
 import os
 
@@ -14,6 +10,8 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/tes
 from contextlib import asynccontextmanager
 from typing import Any, List
 
+import json as _json
+
 import jwt as pyjwt
 import pytest
 from langchain_core.language_models import BaseChatModel
@@ -22,38 +20,74 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from langgraph.checkpoint.memory import MemorySaver
 from pydantic import Field
 
+from agent import SECTION_ORDER
+
 
 # ─── Stub LLM ─────────────────────────────────────────────────────────────────
 
 
 class StubChatModel(BaseChatModel):
-    """In-process LLM that returns scripted responses.
+    """Scripted LLM for tests.
 
-    Tests push strings onto `invoke_responses` for sync .invoke() calls and
-    lists of chunks onto `stream_chunks` for .astream() calls. Both queues
-    pop FIFO. If a queue is empty, a default response is used.
+    Push items onto `invoke_responses` before each test turn. Each item is
+    popped FIFO and can be:
+      - str  → plain AIMessage with that content
+      - list → AIMessage with tool_calls (each element is a tool-call dict:
+                {"name": ..., "args": {...}, "id": ..., "type": "tool_call"})
 
-    Extends BaseChatModel so LangGraph's astream_events emits the standard
-    `on_chat_model_stream` events that the SSE filter looks for.
+    `stream_chunks` is a list of lists: each inner list is the sequence of
+    string chunks returned by one astream() call.
     """
 
-    invoke_responses: List[str] = Field(default_factory=list)
+    invoke_responses: List[Any] = Field(default_factory=list)
     stream_chunks: List[List[str]] = Field(default_factory=list)
     invoke_calls: List[Any] = Field(default_factory=list)
     stream_calls: List[Any] = Field(default_factory=list)
 
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.invoke_calls.append(messages)
-        content = self.invoke_responses.pop(0) if self.invoke_responses else "stub-response"
-        return ChatResult(
-            generations=[ChatGeneration(message=AIMessage(content=content))]
-        )
+        response = self.invoke_responses.pop(0) if self.invoke_responses else "stub-response"
+
+        if isinstance(response, list):
+            # Tool-call response
+            msg = AIMessage(content="", tool_calls=response)
+        else:
+            msg = AIMessage(content=response)
+
+        return ChatResult(generations=[ChatGeneration(message=msg)])
 
     def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        """astream_events routes through _stream instead of _generate.
+        Use stream_chunks when set (for explicit streaming tests); otherwise
+        fall back to invoke_responses so both endpoints share one queue."""
         self.stream_calls.append(messages)
-        chunks = self.stream_chunks.pop(0) if self.stream_chunks else ["stub-stream"]
-        for c in chunks:
-            yield ChatGenerationChunk(message=AIMessageChunk(content=c))
+
+        if self.stream_chunks:
+            for c in self.stream_chunks.pop(0):
+                yield ChatGenerationChunk(message=AIMessageChunk(content=c))
+            return
+
+        response = self.invoke_responses.pop(0) if self.invoke_responses else "stub-response"
+        if isinstance(response, list):
+            # Tool-call response — emit as a single chunk so tools_condition fires.
+            # args must be a JSON string; type must be "tool_call_chunk".
+            yield ChatGenerationChunk(
+                message=AIMessageChunk(
+                    content="",
+                    tool_call_chunks=[
+                        {
+                            "name": tc["name"],
+                            "args": _json.dumps(tc.get("args", {})),
+                            "id": tc.get("id", f"tc_{tc['name']}"),
+                            "index": i,
+                            "type": "tool_call_chunk",
+                        }
+                        for i, tc in enumerate(response)
+                    ],
+                )
+            )
+        else:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=response))
 
     @property
     def _llm_type(self) -> str:
@@ -62,22 +96,19 @@ class StubChatModel(BaseChatModel):
 
 @pytest.fixture
 def stub_llm(monkeypatch):
-    """Replace agent.llm with a fresh StubChatModel for the test."""
     import agent
-
     stub = StubChatModel()
     monkeypatch.setattr(agent, "llm", stub)
+    monkeypatch.setattr(agent, "llm_with_tools", stub)
     return stub
 
 
-# ─── In-memory compiled graph ─────────────────────────────────────────────────
+# ─── Compiled graph with MemorySaver ──────────────────────────────────────────
 
 
 @pytest.fixture
 def memory_graph(stub_llm):
-    """Compile the LangGraph builder against MemorySaver (no PostgreSQL)."""
     import agent
-
     return agent.builder.compile(checkpointer=MemorySaver())
 
 
@@ -86,62 +117,34 @@ def memory_graph(stub_llm):
 
 @pytest.fixture
 def mock_supabase(monkeypatch):
-    """Replace backend.db functions with in-memory dict storage.
-
-    Returns the storage dict so tests can assert on what was persisted.
-    Patches the names on both the db module and the server module, since
-    server imports them by name with `from db import ...`.
-    """
-    storage: dict = {
-        "conversations": [],
-        "messages": [],
-        "business_plans": [],
-    }
+    storage: dict = {"conversations": [], "messages": [], "business_plans": []}
 
     def fake_create_conversation(user_id, session_id):
-        conv = {
-            "id": len(storage["conversations"]) + 1,
-            "user_id": user_id,
-            "session_id": session_id,
-        }
+        conv = {"id": len(storage["conversations"]) + 1, "user_id": user_id, "session_id": session_id}
         storage["conversations"].append(conv)
         return conv
 
     def fake_get_conversation(session_id):
-        for c in storage["conversations"]:
-            if c["session_id"] == session_id:
-                return c
-        return None
+        return next((c for c in storage["conversations"] if c["session_id"] == session_id), None)
 
     def fake_save_business_plan(conv_id, content):
         for bp in storage["business_plans"]:
             if bp["conversation_id"] == conv_id:
                 bp["content"] = content
                 return bp
-        bp = {
-            "id": len(storage["business_plans"]) + 1,
-            "conversation_id": conv_id,
-            "content": content,
-        }
+        bp = {"id": len(storage["business_plans"]) + 1, "conversation_id": conv_id, "content": content}
         storage["business_plans"].append(bp)
         return bp
 
     def fake_save_message(conv_id, role, content):
-        msg = {
-            "id": len(storage["messages"]) + 1,
-            "conversation_id": conv_id,
-            "role": role,
-            "content": content,
-        }
+        msg = {"id": len(storage["messages"]) + 1, "conversation_id": conv_id, "role": role, "content": content}
         storage["messages"].append(msg)
         return msg
 
     def fake_get_messages(conv_id):
         return [m for m in storage["messages"] if m["conversation_id"] == conv_id]
 
-    import db
-    import server
-
+    import db, server
     for mod in (db, server):
         monkeypatch.setattr(mod, "create_conversation", fake_create_conversation, raising=False)
         monkeypatch.setattr(mod, "get_conversation", fake_get_conversation, raising=False)
@@ -152,12 +155,11 @@ def mock_supabase(monkeypatch):
     return storage
 
 
-# ─── FastAPI TestClient with in-memory graph ──────────────────────────────────
+# ─── FastAPI TestClient ────────────────────────────────────────────────────────
 
 
 @pytest.fixture
 def test_app(memory_graph, mock_supabase, monkeypatch):
-    """TestClient that bypasses the real lifespan (no PostgreSQL connection)."""
     from fastapi.testclient import TestClient
     import server
 
@@ -177,21 +179,30 @@ def test_app(memory_graph, mock_supabase, monkeypatch):
 
 @pytest.fixture
 def fake_jwt():
-    """Unsigned JWT with a `sub` claim. server.get_user_id() skips signature verification."""
     return pyjwt.encode({"sub": "test-user-id"}, "secret", algorithm="HS256")
+
+
+# ─── Tool-call response builders ──────────────────────────────────────────────
+
+
+def make_tool_call(name: str, args: dict, call_id: str | None = None) -> dict:
+    """Build a single tool-call dict for use in StubChatModel."""
+    return {"name": name, "args": args, "id": call_id or f"tc_{name}", "type": "tool_call"}
+
+
+def complete_section_call(content: str = "stub content", call_id: str | None = None) -> list:
+    return [make_tool_call("complete_section", {"content": content}, call_id)]
+
+
+def modify_section_call(section: str, call_id: str | None = None) -> list:
+    return [make_tool_call("modify_section", {"section": section}, call_id)]
 
 
 # ─── SSE helpers ──────────────────────────────────────────────────────────────
 
 
 def collect_sse_events(client, url: str, json_payload: dict, headers: dict | None = None) -> list[dict]:
-    """POST to an SSE endpoint and return the parsed event list.
-
-    Mirrors the frontend parser: split on `\\n\\n`, strip `data: ` prefix,
-    json.loads the payload.
-    """
     import json as _json
-
     events: list[dict] = []
     buffer = ""
     with client.stream("POST", url, json=json_payload, headers=headers or {}) as response:
@@ -213,23 +224,17 @@ def collect_sse_events(client, url: str, json_payload: dict, headers: dict | Non
 # ─── Graph-driving helpers ────────────────────────────────────────────────────
 
 
-def drive_through_welcome(client, stub_llm, message: str = "test idea") -> str:
-    """Start a new session and resume past the welcome phase.
-
-    Returns the session_id positioned at the first problem question interrupt.
-    The stub LLM uses default responses (mapping returns {} → no auto-fill).
-    """
-    start = client.post("/chat/start", json={"message": message})
-    session_id = start.json()["session_id"]
-    # Resume with "yes" to clear welcome and land on first section question
-    client.post("/chat/message", json={"session_id": session_id, "message": "yes"})
-    return session_id
-
-
-def answer_n_questions(client, session_id: str, count: int, answer: str = "ok") -> None:
-    """Send `count` /chat/message turns to advance through section questions."""
-    for _ in range(count):
-        client.post(
-            "/chat/message",
-            json={"session_id": session_id, "message": answer},
+def drive_all_sections(client, stub_llm, session_id: str) -> None:
+    """Drive through all 6 sections by having the stub LLM complete each one
+    immediately. Each user turn triggers a complete_section tool call followed
+    by a text response asking the next question."""
+    for i, section in enumerate(SECTION_ORDER):
+        stub_llm.invoke_responses.append(
+            complete_section_call(content=f"{section} collected info")
         )
+        if i < len(SECTION_ORDER) - 1:
+            stub_llm.invoke_responses.append(f"Great! Now let's talk about {SECTION_ORDER[i + 1]}.")
+        # last section: assistant sees current_section == "done" and generates BP
+        # so no text response needed here; the BP generation call handles it
+
+    client.post("/chat/message", json={"session_id": session_id, "message": "drive all sections"})

@@ -8,13 +8,12 @@ import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-from langgraph.types import Command
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel
 
-from agent import builder
+from agent import SECTION_ORDER, builder
 from db import (
     create_conversation,
     get_conversation,
@@ -26,7 +25,8 @@ from db import (
 graph = None
 
 
-# ─── 生命周期：启动时建连接池和 checkpointer ────────────────
+# ─── Lifespan ─────────────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global graph
@@ -53,54 +53,58 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Founder Buddy API", lifespan=lifespan)
 
-# ─── CORS（允许前端访问）───────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # 开发阶段先全开，上线再收紧
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── 请求/响应结构 ─────────────────────────────────────────
+
+# ─── Request / response models ────────────────────────────────────────────────
+
 class StartRequest(BaseModel):
-    message: str                      # 用户第一句话
-    session_id: str | None = None     # 可选，不传就自动生成
+    message: str
+    session_id: str | None = None
 
 class MessageRequest(BaseModel):
-    session_id: str                   # 必须传，对应哪个对话
-    message: str                      # 用户回答
+    session_id: str
+    message: str
 
 class ChatResponse(BaseModel):
     session_id: str
-    agent_message: str | None         # agent 下一句话（None = 对话结束）
-    is_done: bool                     # True = 已生成完整 BP
-    section_status: dict              # 进度条状态
-    business_plan: str | None         # 仅在 is_done=True 时有值
+    agent_message: str | None
+    is_done: bool
+    section_status: dict
+    business_plan: str | None
 
 
-# ─── 辅助函数：读取最新 interrupt ──────────────────────────
-def get_interrupt_message(state) -> str | None:
-    if state.tasks and state.tasks[0].interrupts:
-        return state.tasks[0].interrupts[-1].value
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def get_last_assistant_message(state) -> str | None:
+    """Return the last AIMessage that is not a tool call."""
+    for msg in reversed(state.values.get("messages", [])):
+        if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
+            return msg.content
     return None
+
 
 def get_business_plan(state) -> str | None:
-    messages = state.values.get("messages", [])
-    for msg in reversed(messages):
-        if hasattr(msg, "content") and msg.__class__.__name__ == "AIMessage":
-            if len(msg.content) > 200:
-                return msg.content
+    """Return the last long AIMessage (>200 chars) — the generated business plan."""
+    for msg in reversed(state.values.get("messages", [])):
+        if isinstance(msg, AIMessage) and not msg.tool_calls and len(msg.content) > 200:
+            return msg.content
     return None
 
+
 def build_response(session_id: str, state) -> ChatResponse:
-    interrupt_msg = get_interrupt_message(state)
-    plan_ready_for_edit = state.values.get("current_section") == "done" and interrupt_msg is not None
-    is_done = interrupt_msg is None or plan_ready_for_edit
+    agent_message = get_last_assistant_message(state)
+    is_done = state.values.get("current_section") == "done"
 
     return ChatResponse(
         session_id=session_id,
-        agent_message=interrupt_msg,
+        agent_message=agent_message,
         is_done=is_done,
         section_status=state.values.get("section_status", {}),
         business_plan=get_business_plan(state) if is_done else None,
@@ -124,9 +128,14 @@ def require_graph():
     return graph
 
 
-# ─── POST /chat/start ─────────────────────────────────────
+# ─── POST /chat/start ─────────────────────────────────────────────────────────
+
 @app.post("/chat/start", response_model=ChatResponse)
-async def chat_start(req: StartRequest, user_id: str | None = Depends(get_user_id), g=Depends(require_graph)):
+async def chat_start(
+    req: StartRequest,
+    user_id: str | None = Depends(get_user_id),
+    g=Depends(require_graph),
+):
     session_id = req.session_id or f"session-{uuid.uuid4().hex[:8]}"
     conversation_id = None
     if user_id is not None:
@@ -136,18 +145,10 @@ async def chat_start(req: StartRequest, user_id: str | None = Depends(get_user_i
     config = {"configurable": {"thread_id": session_id}}
     initial_state = {
         "messages": [HumanMessage(content=req.message)],
-        "current_section": "welcome",
-        "current_question_index": 0,
-        "welcome_done": False,
-        "welcome_question_count": 0,
-        "edit_in_progress": False,
-        "section_status": {},
-        "problem": "",
-        "product": "",
-        "features": "",
-        "team_traction": "",
-        "investment": "",
-        "exit_strategy": "",
+        "current_section": "problem",
+        "section_status": {s: "pending" for s in SECTION_ORDER},
+        "problem": "", "product": "", "features": "",
+        "team_traction": "", "investment": "", "exit_strategy": "",
     }
 
     await g.ainvoke(initial_state, config)
@@ -162,7 +163,8 @@ async def chat_start(req: StartRequest, user_id: str | None = Depends(get_user_i
     return response
 
 
-# ─── POST /chat/message ───────────────────────────────────
+# ─── POST /chat/message ───────────────────────────────────────────────────────
+
 @app.post("/chat/message", response_model=ChatResponse)
 async def chat_message(req: MessageRequest, g=Depends(require_graph)):
     config = {"configurable": {"thread_id": req.session_id}}
@@ -171,7 +173,7 @@ async def chat_message(req: MessageRequest, g=Depends(require_graph)):
     if state.values == {}:
         raise HTTPException(status_code=404, detail="Session not found. Please start a new chat.")
 
-    await g.ainvoke(Command(resume=req.message), config)
+    await g.ainvoke({"messages": [HumanMessage(content=req.message)]}, config)
     state = await g.aget_state(config)
     response = build_response(req.session_id, state)
 
@@ -187,7 +189,8 @@ async def chat_message(req: MessageRequest, g=Depends(require_graph)):
     return response
 
 
-# ─── GET /chat/state ──────────────────────────────────────
+# ─── GET /chat/state ──────────────────────────────────────────────────────────
+
 @app.get("/chat/state", response_model=ChatResponse)
 async def chat_state(session_id: str, g=Depends(require_graph)):
     config = {"configurable": {"thread_id": session_id}}
@@ -199,7 +202,8 @@ async def chat_state(session_id: str, g=Depends(require_graph)):
     return build_response(session_id, state)
 
 
-# ─── GET /chat/messages ───────────────────────────────────
+# ─── GET /chat/messages ───────────────────────────────────────────────────────
+
 @app.get("/chat/messages")
 async def get_chat_messages(session_id: str):
     conversation = await asyncio.to_thread(get_conversation, session_id)
@@ -209,7 +213,8 @@ async def get_chat_messages(session_id: str):
     return {"messages": messages}
 
 
-# ─── DB persistence helper for streaming endpoint ─────────
+# ─── DB persistence helper for streaming ─────────────────────────────────────
+
 async def _persist_stream(session_id: str, message: str, response: ChatResponse) -> None:
     try:
         conversation = await asyncio.to_thread(get_conversation, session_id)
@@ -221,10 +226,11 @@ async def _persist_stream(session_id: str, message: str, response: ChatResponse)
             if response.is_done and response.business_plan:
                 await asyncio.to_thread(save_business_plan, conv_id, response.business_plan)
     except Exception:
-        pass  # persistence is best-effort; don't crash the stream
+        pass  # best-effort
 
 
-# ─── POST /chat/stream (SSE) ──────────────────────────────
+# ─── POST /chat/stream (SSE) ──────────────────────────────────────────────────
+
 @app.post("/chat/stream")
 async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
     config = {"configurable": {"thread_id": req.session_id}}
@@ -234,14 +240,18 @@ async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
         raise HTTPException(status_code=404, detail="Session not found. Please start a new chat.")
 
     async def generate():
-        # Phase 1: stream LLM tokens; surface errors to client immediately
         try:
             async for event in g.astream_events(
-                Command(resume=req.message), config, version="v2"
+                {"messages": [HumanMessage(content=req.message)]},
+                config,
+                version="v2",
             ):
+                # Forward tokens only from the assistant node. Tool-call
+                # responses have empty content so they are filtered out by
+                # the `chunk.content` check.
                 if (
                     event["event"] == "on_chat_model_stream"
-                    and event.get("metadata", {}).get("langgraph_node") == "generate_bp"
+                    and event.get("metadata", {}).get("langgraph_node") == "assistant"
                 ):
                     chunk = event["data"].get("chunk")
                     if chunk and chunk.content:
@@ -250,13 +260,10 @@ async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
             yield f"data: {json.dumps({'type': 'error', 'detail': 'Generation failed. Please try again.'})}\n\n"
             return
 
-        # Phase 2: build and send done event so client can proceed immediately
         final_state = await g.aget_state(config)
         response = build_response(req.session_id, final_state)
         yield f"data: {json.dumps({'type': 'done', **response.model_dump()})}\n\n"
 
-        # Phase 3: persist to DB as a fire-and-forget task so a client
-        # disconnect after phase 2 cannot prevent messages from being saved
         asyncio.ensure_future(_persist_stream(req.session_id, req.message, response))
 
     return StreamingResponse(
@@ -266,7 +273,8 @@ async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
     )
 
 
-# ─── 健康检查 ─────────────────────────────────────────────
+# ─── Health ───────────────────────────────────────────────────────────────────
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
