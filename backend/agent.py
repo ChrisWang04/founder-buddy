@@ -1,11 +1,12 @@
+import asyncio
 from dotenv import load_dotenv
-from typing import Annotated
+from typing import Annotated, Literal
 from typing_extensions import TypedDict
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_anthropic import ChatAnthropic
-from langgraph.graph import StateGraph, START
+from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import tools_condition
 
@@ -18,6 +19,7 @@ load_dotenv()
 class FounderBuddyState(TypedDict):
     messages: Annotated[list, add_messages]
     current_section: str
+    last_completed_section: str   # set by tools_node; read by memory_updater
     section_status: dict
     problem: str
     product: str
@@ -92,20 +94,38 @@ def modify_section(section: str) -> str:
     return f"Now editing {section}."
 
 
-llm = ChatAnthropic(model="claude-sonnet-4-6")
+llm = ChatAnthropic(model="claude-sonnet-4-6")          # BP generation (implementation_node)
+llm_qa = ChatAnthropic(model="claude-haiku-4-5-20251001") # Q&A (assistant_node) — 5-10x faster
 _tools = [complete_section, modify_section]
-llm_with_tools = llm.bind_tools(_tools)
+llm_with_tools = llm_qa.bind_tools(_tools)
 
 
 # ─── Nodes ────────────────────────────────────────────────────────────────────
 
 
-async def assistant_node(state: FounderBuddyState, config: RunnableConfig) -> dict:
-    current = state.get("current_section", "problem")
+async def initialize_node(state: FounderBuddyState, config: RunnableConfig) -> dict:
+    """Validate and normalize state on every invocation."""
+    updates: dict = {}
 
-    # Graceful fallback for any stale / invalid section value
+    current = state.get("current_section", SECTION_ORDER[0])
     if current not in SECTION_ORDER and current != "done":
-        current = "problem"
+        updates["current_section"] = SECTION_ORDER[0]
+
+    # Bootstrap section_status on very first message
+    if not state.get("section_status"):
+        updates["section_status"] = {
+            **{s: "pending" for s in SECTION_ORDER},
+            SECTION_ORDER[0]: "in_progress",
+        }
+
+    return updates
+
+
+async def assistant_node(state: FounderBuddyState, config: RunnableConfig) -> dict:
+    """Conversational Q&A — collects section info via tool calls. Never generates the BP."""
+    current = state.get("current_section", SECTION_ORDER[0])
+    if current not in SECTION_ORDER:
+        current = SECTION_ORDER[0]
 
     status_lines = "\n".join(
         f"  {SECTION_LABELS[s]}: {state.get('section_status', {}).get(s, 'pending')}"
@@ -118,32 +138,8 @@ async def assistant_node(state: FounderBuddyState, config: RunnableConfig) -> di
     ]
     collected_str = "\n".join(collected_parts) if collected_parts else "  Nothing collected yet."
 
-    if current == "done":
-        # BP generation — no tools, just write the plan
-        system_content = f"""You are Founder Buddy, an AI startup advisor.
-All sections are complete. Write a comprehensive, investor-ready business plan.
-
-Collected information:
-{collected_str}
-
-Write the full plan with these sections in order:
-1. Executive Summary
-2. Problem & Target User
-3. Product & Solution
-4. Core Features
-5. Team & Traction
-6. Financial Ask & Use of Funds
-7. Exit Strategy
-
-Be specific and compelling. Use the founder's actual words. Do NOT call any tools."""
-
-        response = await llm.ainvoke(
-            [SystemMessage(content=system_content)] + state["messages"],
-            config,
-        )
-    else:
-        section_guidance = SECTION_PROMPTS.get(current, "Continue the conversation.")
-        system_content = f"""You are Founder Buddy, an AI startup advisor helping founders build a business plan.
+    section_guidance = SECTION_PROMPTS.get(current, "Continue the conversation.")
+    system_content = f"""You are Founder Buddy, an AI startup advisor helping founders build a business plan.
 
 Current section: {SECTION_LABELS.get(current, current)}
 {section_guidance}
@@ -157,20 +153,20 @@ Collected so far:
 Rules:
 - Be conversational and encouraging. Keep replies to 2-4 sentences.
 - Ask ONE question at a time.
+- Do NOT use markdown formatting (no **bold**, no bullet points, no headers) — plain text only.
 - When you have enough info for the current section, call complete_section(content="summary").
 - If the user wants to change a previous answer, call modify_section(section="section_name").
 - Do NOT jump ahead — collect the current section fully before moving on."""
 
-        response = await llm_with_tools.ainvoke(
-            [SystemMessage(content=system_content)] + state["messages"],
-            config,
-        )
-
+    response = await llm_with_tools.ainvoke(
+        [SystemMessage(content=system_content)] + state["messages"],
+        config,
+    )
     return {"messages": [response]}
 
 
 def tools_node(state: FounderBuddyState) -> dict:
-    """Execute tool calls and update state."""
+    """Execute tool calls and update section state."""
     messages = state["messages"]
     last_msg = messages[-1] if messages else None
 
@@ -193,10 +189,9 @@ def tools_node(state: FounderBuddyState) -> dict:
                 ))
                 continue
 
-            # Persist the collected summary
             state_updates[current] = args.get("content", "")
+            state_updates["last_completed_section"] = current
 
-            # Advance: next section or done
             idx = SECTION_ORDER.index(current)
             status = dict(state.get("section_status", {}))
             status[current] = "done"
@@ -226,7 +221,8 @@ def tools_node(state: FounderBuddyState) -> dict:
             status[target] = "in_progress"
             state_updates["section_status"] = status
             state_updates["current_section"] = target
-            state_updates[target] = ""  # clear for re-collection
+            state_updates[target] = ""
+            state_updates["last_completed_section"] = ""
             tool_messages.append(ToolMessage(
                 content=f"Switched to editing '{SECTION_LABELS[target]}'. Previous content cleared.",
                 tool_call_id=tc["id"],
@@ -235,21 +231,89 @@ def tools_node(state: FounderBuddyState) -> dict:
     return {**state_updates, "messages": tool_messages}
 
 
+async def memory_updater_node(state: FounderBuddyState, config: RunnableConfig) -> dict:
+    """Persist completed section summaries to Supabase."""
+    last_section = state.get("last_completed_section", "")
+
+    if last_section and last_section in SECTION_ORDER:
+        conv_id = config.get("configurable", {}).get("conversation_id")
+        if conv_id:
+            from db import save_message as db_save
+            content = state.get(last_section, "")
+            label = SECTION_LABELS.get(last_section, last_section)
+            await asyncio.to_thread(
+                db_save,
+                conv_id,
+                "system",
+                f"[Section: {label}]\n{content}",
+            )
+
+    return {}
+
+
+async def implementation_node(state: FounderBuddyState, config: RunnableConfig) -> dict:
+    """Generate the investor-ready business plan from all collected sections."""
+    collected_parts = [
+        f"  {SECTION_LABELS[s]}: {state.get(s, '')}"
+        for s in SECTION_ORDER
+        if state.get(s, "")
+    ]
+    collected_str = "\n".join(collected_parts) if collected_parts else "  Nothing collected yet."
+
+    system_content = f"""You are Founder Buddy, an AI startup advisor.
+All sections are complete. Write a comprehensive, investor-ready business plan.
+
+Collected information:
+{collected_str}
+
+Write the full plan with these sections in order:
+1. Executive Summary
+2. Problem & Target User
+3. Product & Solution
+4. Core Features
+5. Team & Traction
+6. Financial Ask & Use of Funds
+7. Exit Strategy
+
+Be specific and compelling. Use the founder's actual words. Do NOT call any tools."""
+
+    response = await llm.ainvoke(
+        [SystemMessage(content=system_content)] + state["messages"],
+        config,
+    )
+    return {"messages": [response]}
+
+
+def route_after_memory_updater(state: FounderBuddyState) -> Literal["implementation", "assistant"]:
+    if state.get("current_section") == "done":
+        return "implementation"
+    return "assistant"
+
+
 # ─── Graph ────────────────────────────────────────────────────────────────────
 
 builder = StateGraph(FounderBuddyState)
+builder.add_node("initialize", initialize_node)
 builder.add_node("assistant", assistant_node)
 builder.add_node("tools", tools_node)
+builder.add_node("memory_updater", memory_updater_node)
+builder.add_node("implementation", implementation_node)
 
-builder.add_edge(START, "assistant")
+builder.add_edge(START, "initialize")
+builder.add_edge("initialize", "assistant")
 builder.add_conditional_edges("assistant", tools_condition)
-builder.add_edge("tools", "assistant")
+builder.add_edge("tools", "memory_updater")
+builder.add_conditional_edges(
+    "memory_updater",
+    route_after_memory_updater,
+    {"implementation": "implementation", "assistant": "assistant"},
+)
+builder.add_edge("implementation", END)
 
 
 # ─── CLI entry point ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import asyncio
     import time
     from langgraph.checkpoint.memory import MemorySaver
 
@@ -259,7 +323,8 @@ if __name__ == "__main__":
     initial_state = {
         "messages": [],
         "current_section": "problem",
-        "section_status": {s: "pending" for s in SECTION_ORDER},
+        "last_completed_section": "",
+        "section_status": {},
         "problem": "", "product": "", "features": "",
         "team_traction": "", "investment": "", "exit_strategy": "",
     }
@@ -278,7 +343,10 @@ if __name__ == "__main__":
                 None,
             )
             if last_ai:
-                print(f"\nAgent: {last_ai.content}")
+                content = last_ai.content
+                if isinstance(content, list):
+                    content = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+                print(f"\nAgent: {content}")
 
             if st.values.get("current_section") == "done":
                 print("\n=== Business Plan Generated ===")

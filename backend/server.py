@@ -82,19 +82,34 @@ class ChatResponse(BaseModel):
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def _extract_text(content) -> str:
+    """Normalize AIMessage content — may be a plain string or a list of content blocks."""
+    if isinstance(content, list):
+        return "".join(
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return content or ""
+
+
 def get_last_assistant_message(state) -> str | None:
     """Return the last AIMessage that is not a tool call."""
     for msg in reversed(state.values.get("messages", [])):
         if isinstance(msg, AIMessage) and not msg.tool_calls and msg.content:
-            return msg.content
+            text = _extract_text(msg.content)
+            if text:
+                return text
     return None
 
 
 def get_business_plan(state) -> str | None:
     """Return the last long AIMessage (>200 chars) — the generated business plan."""
     for msg in reversed(state.values.get("messages", [])):
-        if isinstance(msg, AIMessage) and not msg.tool_calls and len(msg.content) > 200:
-            return msg.content
+        if isinstance(msg, AIMessage) and not msg.tool_calls:
+            text = _extract_text(msg.content)
+            if len(text) > 200:
+                return text
     return None
 
 
@@ -142,11 +157,12 @@ async def chat_start(
         conversation = await asyncio.to_thread(create_conversation, user_id, session_id)
         conversation_id = conversation.get("id") if conversation else None
 
-    config = {"configurable": {"thread_id": session_id}}
+    config = {"configurable": {"thread_id": session_id, "conversation_id": conversation_id}}
     initial_state = {
         "messages": [HumanMessage(content=req.message)],
         "current_section": "problem",
-        "section_status": {s: "pending" for s in SECTION_ORDER},
+        "last_completed_section": "",
+        "section_status": {},
         "problem": "", "product": "", "features": "",
         "team_traction": "", "investment": "", "exit_strategy": "",
     }
@@ -167,7 +183,9 @@ async def chat_start(
 
 @app.post("/chat/message", response_model=ChatResponse)
 async def chat_message(req: MessageRequest, g=Depends(require_graph)):
-    config = {"configurable": {"thread_id": req.session_id}}
+    conversation = await asyncio.to_thread(get_conversation, req.session_id)
+    conv_id = conversation["id"] if conversation else None
+    config = {"configurable": {"thread_id": req.session_id, "conversation_id": conv_id}}
 
     state = await g.aget_state(config)
     if state.values == {}:
@@ -177,9 +195,7 @@ async def chat_message(req: MessageRequest, g=Depends(require_graph)):
     state = await g.aget_state(config)
     response = build_response(req.session_id, state)
 
-    conversation = await asyncio.to_thread(get_conversation, req.session_id)
-    if conversation:
-        conv_id = conversation["id"]
+    if conv_id:
         await asyncio.to_thread(save_message, conv_id, "user", req.message)
         if response.agent_message:
             await asyncio.to_thread(save_message, conv_id, "assistant", response.agent_message)
@@ -233,7 +249,9 @@ async def _persist_stream(session_id: str, message: str, response: ChatResponse)
 
 @app.post("/chat/stream")
 async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
-    config = {"configurable": {"thread_id": req.session_id}}
+    conversation = await asyncio.to_thread(get_conversation, req.session_id)
+    conv_id = conversation["id"] if conversation else None
+    config = {"configurable": {"thread_id": req.session_id, "conversation_id": conv_id}}
 
     state = await g.aget_state(config)
     if state.values == {}:
@@ -246,16 +264,34 @@ async def chat_stream(req: MessageRequest, g=Depends(require_graph)):
                 config,
                 version="v2",
             ):
-                # Forward tokens only from the assistant node. Tool-call
-                # responses have empty content so they are filtered out by
-                # the `chunk.content` check.
-                if (
-                    event["event"] == "on_chat_model_stream"
-                    and event.get("metadata", {}).get("langgraph_node") == "assistant"
-                ):
-                    chunk = event["data"].get("chunk")
-                    if chunk and chunk.content:
-                        yield f"data: {json.dumps({'type': 'token', 'content': chunk.content})}\n\n"
+                if event["event"] != "on_chat_model_stream":
+                    continue
+                node = event.get("metadata", {}).get("langgraph_node")
+                if node not in ("assistant", "implementation"):
+                    continue
+
+                chunk = event["data"].get("chunk")
+                if not chunk:
+                    continue
+
+                content = chunk.content
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    # Extract plain text, skip tool_use blocks
+                    text = "".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                else:
+                    text = ""
+
+                if text:
+                    # assistant → Q&A chat bubble; implementation → BP panel
+                    event_type = "bp_token" if node == "implementation" else "token"
+                    yield f"data: {json.dumps({'type': event_type, 'content': text})}\n\n"
+
         except Exception:
             yield f"data: {json.dumps({'type': 'error', 'detail': 'Generation failed. Please try again.'})}\n\n"
             return
