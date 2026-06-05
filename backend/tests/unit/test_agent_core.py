@@ -1,9 +1,17 @@
-"""Unit tests for agent.py — tools_node state transitions."""
+"""Unit tests for agent.py — tools_node state transitions, initialize_node, route_after_memory_updater."""
+
+import asyncio
 
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
 
-from agent import SECTION_ORDER, SECTION_LABELS, tools_node
+from agent import (
+    SECTION_ORDER,
+    SECTION_LABELS,
+    initialize_node,
+    route_after_memory_updater,
+    tools_node,
+)
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -12,12 +20,17 @@ def _base_state(**overrides):
     state = {
         "messages": [],
         "current_section": "problem",
+        "last_completed_section": "",
         "section_status": {s: "pending" for s in SECTION_ORDER},
         "problem": "", "product": "", "features": "",
         "team_traction": "", "investment": "", "exit_strategy": "",
     }
     state.update(overrides)
     return state
+
+
+def _run(coro):
+    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 def _ai_tool(name: str, args: dict, call_id: str = "tc1") -> AIMessage:
@@ -102,6 +115,26 @@ class TestCompleteSection:
             result = tools_node(state)
             expected_next = SECTION_ORDER[i + 1] if i + 1 < len(SECTION_ORDER) else "done"
             assert result["current_section"] == expected_next
+
+    def test_sets_last_completed_section(self):
+        state = _base_state(
+            messages=[_ai_tool("complete_section", {"content": "x"})],
+            current_section="problem",
+        )
+        result = tools_node(state)
+        assert result["last_completed_section"] == "problem"
+
+    def test_last_section_sets_last_completed_section(self):
+        last = SECTION_ORDER[-1]
+        status = {s: "done" for s in SECTION_ORDER}
+        status[last] = "in_progress"
+        state = _base_state(
+            messages=[_ai_tool("complete_section", {"content": "exit"})],
+            current_section=last,
+            section_status=status,
+        )
+        result = tools_node(state)
+        assert result["last_completed_section"] == last
 
 
 # ─── modify_section ───────────────────────────────────────────────────────────
@@ -218,3 +251,53 @@ class TestMultipleToolCalls:
         result = tools_node(state)
         assert len(result["messages"]) == 1
         assert result["current_section"] == "product"
+
+
+# ─── initialize_node ──────────────────────────────────────────────────────────
+
+
+class TestInitializeNode:
+    def test_bootstraps_section_status_when_missing(self):
+        state = _base_state(section_status={})
+        result = _run(initialize_node(state, {}))
+        assert result["section_status"][SECTION_ORDER[0]] == "in_progress"
+        for s in SECTION_ORDER[1:]:
+            assert result["section_status"][s] == "pending"
+
+    def test_no_update_when_section_status_already_set(self):
+        state = _base_state()  # has non-empty section_status
+        result = _run(initialize_node(state, {}))
+        assert "section_status" not in result
+
+    def test_fixes_invalid_current_section(self):
+        state = _base_state(current_section="not_a_real_section")
+        result = _run(initialize_node(state, {}))
+        assert result["current_section"] == SECTION_ORDER[0]
+
+    def test_valid_current_section_not_touched(self):
+        state = _base_state(current_section="product")
+        result = _run(initialize_node(state, {}))
+        assert "current_section" not in result
+
+    def test_done_current_section_not_reset(self):
+        state = _base_state(current_section="done")
+        result = _run(initialize_node(state, {}))
+        assert "current_section" not in result
+
+
+# ─── route_after_memory_updater ───────────────────────────────────────────────
+
+
+class TestRouteAfterMemoryUpdater:
+    def test_routes_to_implementation_when_done(self):
+        state = _base_state(current_section="done")
+        assert route_after_memory_updater(state) == "implementation"
+
+    def test_routes_to_assistant_for_every_active_section(self):
+        for section in SECTION_ORDER:
+            state = _base_state(current_section=section)
+            assert route_after_memory_updater(state) == "assistant"
+
+    def test_routes_to_assistant_for_unknown_value(self):
+        state = _base_state(current_section="")
+        assert route_after_memory_updater(state) == "assistant"

@@ -53,33 +53,41 @@ class TestStreamSectionAdvance:
 
 
 class TestStreamBPGeneration:
-    def test_bp_generation_streams_tokens_and_done(self, test_app, stub_llm):
+    def test_last_section_streams_bp_tokens_from_implementation(self, test_app, stub_llm):
+        """Completing the final section via /chat/stream should trigger
+        implementation_node, which emits bp_token events (not token events)."""
         stub_llm.invoke_responses.append("Tell me about the problem.")
         start = test_app.post("/chat/start", json={"message": "coffee shop"})
         session_id = start.json()["session_id"]
 
         from agent import SECTION_ORDER
-        # Complete all sections
-        for i, section in enumerate(SECTION_ORDER):
+
+        # Drive sections 1-5 via /chat/message (each: tool_call + text response)
+        for i, section in enumerate(SECTION_ORDER[:-1]):
             stub_llm.invoke_responses.append(complete_section_call(f"{section} info"))
-            if i < len(SECTION_ORDER) - 1:
-                stub_llm.invoke_responses.append(f"Now section {i+1}.")
+            stub_llm.invoke_responses.append(f"Now let's talk about {SECTION_ORDER[i+1]}.")
+            test_app.post("/chat/message", json={"session_id": session_id, "message": f"answer for {section}"})
 
-        # Drive through sections (all in one call via tool loops)
-        for _ in range(len(SECTION_ORDER)):
-            test_app.post("/chat/message", json={"session_id": session_id, "message": "ok"})
+        # Final section via /chat/stream:
+        #   assistant emits complete_section tool call (no token events)
+        #   tools_node sets current_section="done"
+        #   memory_updater routes to implementation_node
+        #   implementation_node emits bp_token events
+        bp_text = "Executive Summary\n\n" + "Business plan content. " * 15
+        stub_llm.invoke_responses.append(complete_section_call("exit strategy info"))
+        stub_llm.invoke_responses.append(bp_text)
 
-        # BP generation: stream chunks
-        stub_llm.stream_chunks.append(["Executive Summary: ", "Coffee shop plan. " * 20])
         events = collect_sse_events(
             test_app, "/chat/stream",
-            {"session_id": session_id, "message": "generate"},
+            {"session_id": session_id, "message": "our exit is acquisition"},
         )
 
-        tokens = [e for e in events if e.get("type") == "token"]
+        bp_tokens = [e for e in events if e.get("type") == "bp_token"]
+        token_events = [e for e in events if e.get("type") == "token"]
         done = [e for e in events if e.get("type") == "done"]
 
-        assert len(tokens) > 0
+        assert len(bp_tokens) > 0, "implementation_node should emit bp_token events"
+        assert len(token_events) == 0, "Q&A token events must not appear during BP generation"
         assert len(done) == 1
         assert done[0]["is_done"] is True
         assert done[0]["business_plan"] is not None

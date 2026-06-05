@@ -98,7 +98,10 @@ class StubChatModel(BaseChatModel):
 def stub_llm(monkeypatch):
     import agent
     stub = StubChatModel()
+    # llm → implementation_node (BP generation, Sonnet)
+    # llm_qa / llm_with_tools → assistant_node (Q&A, Haiku)
     monkeypatch.setattr(agent, "llm", stub)
+    monkeypatch.setattr(agent, "llm_qa", stub)
     monkeypatch.setattr(agent, "llm_with_tools", stub)
     return stub
 
@@ -225,16 +228,21 @@ def collect_sse_events(client, url: str, json_payload: dict, headers: dict | Non
 
 
 def drive_all_sections(client, stub_llm, session_id: str) -> None:
-    """Drive through all 6 sections by having the stub LLM complete each one
-    immediately. Each user turn triggers a complete_section tool call followed
-    by a text response asking the next question."""
+    """Drive through all 6 sections via /chat/message.
+
+    Each section turn: assistant emits a complete_section tool call, then
+    memory_updater routes back to assistant for a follow-up question.
+    On the last section memory_updater routes to implementation_node instead,
+    which needs a BP response (>200 chars) so build_response finds it.
+    """
     for i, section in enumerate(SECTION_ORDER):
         stub_llm.invoke_responses.append(
             complete_section_call(content=f"{section} collected info")
         )
         if i < len(SECTION_ORDER) - 1:
             stub_llm.invoke_responses.append(f"Great! Now let's talk about {SECTION_ORDER[i + 1]}.")
-        # last section: assistant sees current_section == "done" and generates BP
-        # so no text response needed here; the BP generation call handles it
+        else:
+            # Last section: memory_updater routes to implementation_node which calls llm.ainvoke()
+            stub_llm.invoke_responses.append("Executive Summary\n\n" + "Business plan details. " * 15)
 
     client.post("/chat/message", json={"session_id": session_id, "message": "drive all sections"})

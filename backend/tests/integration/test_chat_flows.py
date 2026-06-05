@@ -38,6 +38,10 @@ def test_full_happy_path_all_sections(test_app, stub_llm):
         stub_llm.invoke_responses.append(complete_section_call(f"{section} info"))
         if not is_last:
             stub_llm.invoke_responses.append(f"Now {SECTION_ORDER[i+1]}.")
+        else:
+            # After last section tools_node sets current_section="done" and
+            # memory_updater routes to implementation_node, which calls llm.ainvoke().
+            stub_llm.invoke_responses.append("Executive Summary\n\n" + "Business plan. " * 15)
 
         resp = test_app.post(
             "/chat/message",
@@ -45,9 +49,11 @@ def test_full_happy_path_all_sections(test_app, stub_llm):
         )
         assert resp.status_code == 200
 
-    # At this point current_section should be "done"
-    state_resp = test_app.get(f"/chat/state?session_id={session_id}")
-    assert state_resp.json()["section_status"]["exit_strategy"] == "done"
+    # Last response: implementation_node ran and produced the BP
+    data = resp.json()
+    assert data["is_done"] is True
+    assert data["business_plan"] is not None
+    assert data["section_status"]["exit_strategy"] == "done"
 
 
 def test_skip_section_with_skip_text(test_app, stub_llm):
