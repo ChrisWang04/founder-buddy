@@ -13,6 +13,7 @@ interface ChatInterfaceProps {
   messages: Message[];
   onSendMessage: (message: string) => void;
   isLoading: boolean;
+  streamingMessage?: string;
   autoScroll?: boolean;
 }
 
@@ -22,7 +23,7 @@ const examplePrompts = [
   { text: "I have an idea for an AI fitness app", icon: "🤖" },
 ];
 
-export default function ChatInterface({ messages, onSendMessage, isLoading, autoScroll = true }: ChatInterfaceProps) {
+export default function ChatInterface({ messages, onSendMessage, isLoading, streamingMessage = "", autoScroll = true }: ChatInterfaceProps) {
   const [input, setInput] = useState("");
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -33,7 +34,7 @@ export default function ChatInterface({ messages, onSendMessage, isLoading, auto
       top: messagesContainerRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, isLoading, autoScroll]);
+  }, [messages, isLoading, streamingMessage, autoScroll]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -107,7 +108,24 @@ export default function ChatInterface({ messages, onSendMessage, isLoading, auto
           </div>
         ))}
 
-        {isLoading && (
+        {streamingMessage && (
+          <div className="flex justify-start">
+            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center mr-3 flex-shrink-0 mt-1">
+              <Lightbulb className="w-4 h-4 text-white" />
+            </div>
+            <div className="max-w-[75%] bg-white border border-slate-100 text-slate-800 rounded-2xl rounded-tl-sm shadow-sm px-5 py-4">
+              <div className="text-xs text-blue-600 mb-1.5 font-bold uppercase tracking-wider">
+                Founder Buddy
+              </div>
+              <div className="text-[15px] leading-relaxed whitespace-pre-wrap">
+                {streamingMessage}
+                <span className="inline-block w-0.5 h-4 bg-blue-500 ml-0.5 animate-pulse align-middle" />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {isLoading && !streamingMessage && (
           <div className="flex justify-start items-end">
             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center mr-3 flex-shrink-0">
               <Lightbulb className="w-4 h-4 text-white" />

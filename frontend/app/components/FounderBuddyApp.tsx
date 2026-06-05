@@ -7,7 +7,7 @@ import ChatInterface, { type Message } from "./ChatInterface";
 import BusinessPlanDisplay from "./BusinessPlanDisplay";
 import { createClient } from "@/lib/supabase";
 import { parseSSEBuffer } from "@/lib/sse";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import type { User } from "@supabase/supabase-js";
 
@@ -28,9 +28,15 @@ export default function FounderBuddyApp() {
   const [progress, setProgress] = useState<ProgressState>(initialProgress);
   const [businessPlan, setBusinessPlan] = useState<string | null>(null);
   const [streamingBP, setStreamingBP] = useState("");
+  const [streamingMessage, setStreamingMessage] = useState("");
+  // Only show the BP panel once the server confirms is_done=true or a completed
+  // conversation is loaded. Prevents streamingBP from flickering during Q&A.
+  const [bpReady, setBpReady] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [convListKey, setConvListKey] = useState(0);
   const [user, setUser] = useState<User | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsRef = useRef<HTMLDivElement | null>(null);
   const supabase = createClient();
   const router = useRouter();
 
@@ -47,6 +53,19 @@ export default function FounderBuddyApp() {
     await supabase.auth.signOut();
     router.push("/login");
   };
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+
+    const handleDocumentClick = (event: MouseEvent) => {
+      if (!settingsRef.current?.contains(event.target as Node)) {
+        setSettingsOpen(false);
+      }
+    };
+
+    document.addEventListener("click", handleDocumentClick);
+    return () => document.removeEventListener("click", handleDocumentClick);
+  }, [settingsOpen]);
 
   const handleSendMessage = async (content: string) => {
     const userMessage: Message = {
@@ -107,20 +126,31 @@ export default function FounderBuddyApp() {
         buffer = remainder;
         for (const event of events) {
           if (event.type === "token") {
-            setStreamingBP((prev) => prev + (event as { content: string }).content);
+            const tokenContent = (event as { content: unknown }).content;
+            if (typeof tokenContent === "string") {
+              setStreamingMessage((prev) => prev + tokenContent);
+            }
+          } else if (event.type === "bp_token") {
+            const tokenContent = (event as { content: unknown }).content;
+            if (typeof tokenContent === "string") {
+              setStreamingBP((prev) => prev + tokenContent);
+            }
           } else if (event.type === "done") {
             const doneEvent = event as Record<string, unknown>;
-            // Set businessPlan before clearing streamingBP to avoid a
-            // render frame where both are empty and the panel unmounts
+            setStreamingMessage("");
             if (doneEvent.is_done && doneEvent.business_plan) {
+              setBpReady(true);
               setBusinessPlan(doneEvent.business_plan as string);
+              setStreamingBP("");
+            } else {
+              // Q&A turn finished — discard any stray bp_token content
+              setStreamingBP("");
             }
-            setStreamingBP("");
             const sectionStatus = doneEvent.section_status as Record<string, string> | undefined;
             if (sectionStatus && Object.keys(sectionStatus).length > 0) {
               setProgress(sectionStatus as unknown as ProgressState);
             }
-            if (doneEvent.agent_message) {
+            if (!doneEvent.is_done && doneEvent.agent_message) {
               setMessages((prev) => [...prev, {
                 id: (Date.now() + 1).toString(),
                 role: "assistant",
@@ -156,7 +186,7 @@ export default function FounderBuddyApp() {
         },
       ]);
     } finally {
-      // Always clear streaming state even if the stream ends without a done event
+      setStreamingMessage("");
       setStreamingBP("");
       setIsLoading(false);
     }
@@ -174,12 +204,15 @@ export default function FounderBuddyApp() {
     setProgress(initialProgress);
     setBusinessPlan(null);
     setStreamingBP("");
-    setIsLoading(false); // reset in case a fetch was in-flight when the user switched
+    setStreamingMessage("");
+    setBpReady(false);
+    setIsLoading(false);
   };
 
   const handleLoadConversation = async (sessionId: string, businessPlan: string | null) => {
     setSessionId(sessionId);
     setBusinessPlan(businessPlan);
+    setBpReady(!!businessPlan); // only show BP panel if this conversation is already done
     setIsLoading(false);
 
     try {
@@ -287,14 +320,28 @@ export default function FounderBuddyApp() {
                 <div className="text-sm font-semibold text-slate-200 truncate">{user?.email}</div>
                 <div className="text-xs text-blue-400/90 font-medium">Pro Plan</div>
               </div>
-              <button
-                type="button"
-                onClick={handleSignOut}
-                aria-label="Sign out"
-                className="text-slate-500 group-hover:text-slate-300 transition-colors"
-              >
-                <Settings className="w-5 h-5" />
-              </button>
+              <div className="relative" ref={settingsRef}>
+                <button
+                  type="button"
+                  onClick={() => setSettingsOpen((open) => !open)}
+                  aria-label="Open settings"
+                  aria-expanded={settingsOpen}
+                  className="text-slate-500 group-hover:text-slate-300 transition-colors"
+                >
+                  <Settings className="w-5 h-5" />
+                </button>
+                {settingsOpen && (
+                  <div className="absolute bottom-full right-0 mb-2 w-32 rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-xl">
+                    <button
+                      type="button"
+                      onClick={handleSignOut}
+                      className="w-full px-3 py-2 text-left text-sm font-medium text-slate-200 hover:bg-slate-800"
+                    >
+                      Log out
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -306,8 +353,9 @@ export default function FounderBuddyApp() {
               messages={messages}
               onSendMessage={handleSendMessage}
               isLoading={isLoading}
+              streamingMessage={streamingMessage}
             />
-            {(streamingBP || businessPlan) && (
+            {bpReady && (streamingBP || businessPlan) && (
               <div className="mt-8">
                 <BusinessPlanDisplay
                   content={streamingBP || businessPlan!}

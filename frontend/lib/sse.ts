@@ -10,6 +10,7 @@
 
 export type SSEEvent =
   | { type: "token"; content: string }
+  | { type: "bp_token"; content: string }
   | { type: "done"; [k: string]: unknown }
   | { type: "error"; detail?: string };
 
