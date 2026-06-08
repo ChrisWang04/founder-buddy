@@ -43,29 +43,30 @@ SECTION_LABELS = {
 SECTION_PROMPTS = {
     "problem": """You are collecting the PROBLEM section.
 Goal: understand the pain point, who experiences it, and how it is currently solved (poorly).
-When you have clear answers, call complete_section(content="concise summary").
+Ask AT MOST 3 questions total, then call complete_section(content="concise summary").
 Cover: (1) the pain point, (2) who has it, (3) existing bad solutions.""",
 
     "product": """You are collecting the PRODUCT section.
 Goal: understand what the product/service is and how it solves the problem.
-When clear, call complete_section(content="concise summary").
+Ask AT MOST 3 questions total, then call complete_section(content="concise summary").
 Cover: what it is, how it works, what makes it different.""",
 
     "features": """You are collecting the FEATURES section.
 Goal: understand the core capabilities (up to 5) and the standout feature.
-When clear, call complete_section(content="concise summary").""",
+Ask AT MOST 3 questions total, then call complete_section(content="concise summary").""",
 
     "team_traction": """You are collecting the TEAM & TRACTION section.
 Goal: understand who is building this and any early validation (users, revenue, partnerships).
-"None yet" is a valid traction answer. When clear, call complete_section(content="concise summary").""",
+Ask AT MOST 3 questions total. "None yet" is a valid traction answer.
+When done, call complete_section(content="concise summary").""",
 
     "investment": """You are collecting the INVESTMENT section.
 Goal: understand the funding ask and planned use of funds.
-When clear, call complete_section(content="concise summary").""",
+Ask AT MOST 3 questions total, then call complete_section(content="concise summary").""",
 
     "exit_strategy": """You are collecting the EXIT STRATEGY section.
 Goal: understand the long-term vision — acquisition, IPO, or lifestyle business.
-When clear, call complete_section(content="concise summary").
+Ask AT MOST 3 questions total, then call complete_section(content="concise summary").
 This is the last section — after calling complete_section the business plan will be generated automatically.""",
 }
 
